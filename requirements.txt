@@ -1,0 +1,10 @@
+Flask
+flask-cors
+werkzeug
+gunicorn
+requests
+Pyrogram
+Telethon
+python-telegram-bot
+pyTelegramBotAPI
+aiogram
