@@ -1,3 +1,9 @@
+# ================================
+# HOSTPY PRO BACKEND — FULL BUILD
+# Flask + SQLite + Telebot
+# Multi-User Bot Hosting System
+# ================================
+
 import os
 import sys
 import shutil
@@ -5,7 +11,6 @@ import zipfile
 import subprocess
 import sqlite3
 import time
-import json
 import re
 import threading
 import telebot
@@ -14,328 +19,399 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+# ================= CONFIG =================
 
-# --- CONFIGURATION ---
-app.secret_key = os.environ.get("SECRET_KEY", "hostpromax_super_secret_key_2024")
+app = Flask(__name__)
+CORS(app)
+
+SECRET_KEY = os.environ.get("SECRET_KEY", "hostpy_super_secret")
 UPLOAD_FOLDER = "user_uploads"
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DB_NAME = os.path.join(BASE_DIR, "hostpromax.db")
+DB_NAME = os.path.join(BASE_DIR, "hostpy.db")
 
-# সকল হার্ডকোডড পাসওয়ার্ড সরানো হয়েছে
-
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 running_processes = {}
 server_start_time = time.time()
 
-# --- DATABASE SETUP ---
+# ================= DATABASE =================
+
 def init_db():
-    conn = sqlite3.connect(DB_NAME, timeout=10)
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # chat_id কলাম যোগ করা হয়েছে সঠিক ব্রডকাস্টের জন্য
-    c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, bot_token TEXT, chat_id TEXT)''')
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        password TEXT,
+        bot_token TEXT,
+        chat_id TEXT
+    )
+    """)
+
     conn.commit()
     conn.close()
 
 init_db()
 
+
 def get_db():
-    conn = sqlite3.connect(DB_NAME, timeout=10)
+    conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     return conn
 
-# --- TOKEN EXTRACTOR ---
-def extract_token_from_code(file_path):
+# ================= UTILITIES =================
+
+def extract_token_from_code(path):
+    """Detect Telegram Bot Token from Python code"""
     try:
-        with open(file_path, 'r', errors='ignore') as f:
+        with open(path, "r", errors="ignore") as f:
             content = f.read()
+
         pattern = r'\b\d{9,10}:[A-Za-z0-9_-]{30,40}\b'
         match = re.search(pattern, content)
+
         if match:
             return match.group(0)
+
     except Exception as e:
-        print(f"Token extraction error: {e}")
+        print("Token extraction error:", e)
+
     return None
 
-# --- SMART FILE FINDER ---
-def find_bot_file(folder_path):
-    priority_files = ["main.py", "app.py", "bot.py", "index.py", "start.py", "run.py"]
-    
-    for f in priority_files:
-        full_path = os.path.join(folder_path, f)
-        if os.path.exists(full_path):
-            return full_path, folder_path
-            
-    for root, dirs, files in os.walk(folder_path):
-        if "__pycache__" in root or ".git" in root: continue
-        for f in priority_files:
-            if f in files:
-                return os.path.join(root, f), root
+
+def find_main_py(folder):
+    """Find main bot file"""
+    priority = ["main.py", "app.py", "bot.py", "run.py", "start.py"]
+
+    for f in priority:
+        p = os.path.join(folder, f)
+        if os.path.exists(p):
+            return p, folder
+
+    for root, _, files in os.walk(folder):
         for f in files:
             if f.endswith(".py"):
                 return os.path.join(root, f), root
+
     return None, None
 
-# --- API ROUTES ---
+# ================= CHAT ID COLLECTOR =================
 
-@app.route('/')
+def collect_chat_id(username, token):
+    """
+    Try up to 60 sec to capture chat_id
+    Requires user to send /start
+    """
+
+    bot = telebot.TeleBot(token)
+
+    for _ in range(12):  # 12 × 5 sec = ~60 sec
+        try:
+            updates = bot.get_updates(limit=1, timeout=10)
+
+            if updates:
+                upd = updates[0]
+                if upd.message:
+                    chat_id = str(upd.message.chat.id)
+
+                    conn = get_db()
+                    conn.execute(
+                        "UPDATE users SET chat_id=? WHERE username=?",
+                        (chat_id, username)
+                    )
+                    conn.commit()
+                    conn.close()
+
+                    print(f"[CHAT SAVED] {username} -> {chat_id}")
+                    return
+
+        except Exception as e:
+            print("ChatID error:", e)
+
+        time.sleep(5)
+
+    print(f"[NO CHAT] {username} did not start bot")
+
+# ================= HOME =================
+
+@app.route("/")
 def home():
-    return jsonify({"status": "Running", "message": "Host Pro Max Backend V2.2 Fixed"})
+    return jsonify({
+        "status": "Hostpy Backend Running",
+        "uptime": int(time.time() - server_start_time)
+    })
 
-@app.route('/register', methods=['POST'])
+# ================= REGISTER =================
+
+@app.route("/register", methods=["POST"])
 def register():
     data = request.json
-    u = data.get('username')
-    p = data.get('password')
-    if not u or not p: return jsonify({"error": "Missing fields"}), 400
+    u = data.get("username")
+    p = data.get("password")
+
+    if not u or not p:
+        return jsonify({"error": "Missing fields"}), 400
+
+    conn = get_db()
     try:
-        conn = get_db()
-        conn.execute("INSERT INTO users (username, password, bot_token, chat_id) VALUES (?, ?, ?, ?)", 
-                     (u, generate_password_hash(p), "", ""))
+        conn.execute(
+            "INSERT INTO users (username,password,bot_token,chat_id) VALUES (?,?,?,?)",
+            (u, generate_password_hash(p), "", "")
+        )
         conn.commit()
-        return jsonify({"message": "Success"})
+        return jsonify({"message": "Registered"})
     except:
-        return jsonify({"error": "Username taken"}), 409
+        return jsonify({"error": "Username exists"}), 409
     finally:
         conn.close()
 
-@app.route('/login', methods=['POST'])
+# ================= LOGIN =================
+
+@app.route("/login", methods=["POST"])
 def login():
     data = request.json
-    conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE username = ?", (data.get('username'),)).fetchone()
-    conn.close()
-    if user and check_password_hash(user['password'], data.get('password')):
-        return jsonify({"message": "Login successful", "username": user['username']})
-    return jsonify({"error": "Wrong credentials"}), 401
 
-@app.route('/upload', methods=['POST'])
+    conn = get_db()
+    user = conn.execute(
+        "SELECT * FROM users WHERE username=?",
+        (data.get("username"),)
+    ).fetchone()
+    conn.close()
+
+    if user and check_password_hash(user["password"], data.get("password")):
+        return jsonify({"message": "Login success"})
+
+    return jsonify({"error": "Invalid credentials"}), 401
+
+# ================= UPLOAD BOT =================
+
+@app.route("/upload", methods=["POST"])
 def upload():
-    username = request.form.get('username')
-    if not username: return jsonify({"error": "No username provided"}), 400
-    
-    if 'file' not in request.files:
-        return jsonify({"error": "No file sent"}), 400
-        
-    file = request.files['file']
+    username = request.form.get("username")
+    file = request.files.get("file")
+
+    if not username or not file:
+        return jsonify({"error": "Missing data"}), 400
+
     filename = secure_filename(file.filename)
     ext = os.path.splitext(filename)[1].lower()
-    
-    if ext not in ['.zip', '.py']:
-        return jsonify({"error": f"Invalid file type: {ext}."}), 400
-        
+
+    if ext not in [".zip", ".py"]:
+        return jsonify({"error": "Invalid file"}), 400
+
     app_name = os.path.splitext(filename)[0]
     user_dir = os.path.join(UPLOAD_FOLDER, username, app_name)
-    
-    if os.path.exists(user_dir):
-        try: shutil.rmtree(user_dir)
-        except: pass
+
+    shutil.rmtree(user_dir, ignore_errors=True)
     os.makedirs(user_dir, exist_ok=True)
-    
+
     save_path = os.path.join(user_dir, filename)
     file.save(save_path)
-    
-    detected_token = None
-    
-    if ext == '.zip':
-        try:
-            with zipfile.ZipFile(save_path, 'r') as z:
-                z.extractall(user_dir)
-            os.remove(save_path)
-            
-            main_file, _ = find_bot_file(user_dir)
-            if main_file:
-                detected_token = extract_token_from_code(main_file)
-            
-        except Exception as e:
-            return jsonify({"error": f"Zip failed: {str(e)}"}), 500
+
+    token = None
+
+    if ext == ".zip":
+        with zipfile.ZipFile(save_path, "r") as z:
+            z.extractall(user_dir)
+
+        os.remove(save_path)
+
+        main_file, _ = find_main_py(user_dir)
+        if main_file:
+            token = extract_token_from_code(main_file)
+
     else:
-        detected_token = extract_token_from_code(save_path)
+        token = extract_token_from_code(save_path)
 
-    if detected_token:
-        try:
-            conn = get_db()
-            # টোকেন আপডেট করছি, কিন্তু Chat ID এখনো পরিষ্কার নেই
-            conn.execute("UPDATE users SET bot_token = ? WHERE username = ?", (detected_token, username))
-            conn.commit()
-            conn.close()
-        except: pass
-             
-    return jsonify({"message": "Upload Successful!", "token_detected": bool(detected_token)})
+    if token:
+        conn = get_db()
+        conn.execute(
+            "UPDATE users SET bot_token=? WHERE username=?",
+            (token, username)
+        )
+        conn.commit()
+        conn.close()
 
-@app.route('/my_apps', methods=['POST'])
+    return jsonify({"message": "Upload success", "token_found": bool(token)})
+
+# ================= LIST APPS =================
+
+@app.route("/my_apps", methods=["POST"])
 def my_apps():
-    username = request.json.get('username')
+    username = request.json.get("username")
     user_path = os.path.join(UPLOAD_FOLDER, username)
-    
-    if not os.path.exists(user_path): return jsonify({"apps": []})
-    
+
+    if not os.path.exists(user_path):
+        return jsonify({"apps": []})
+
     apps = []
+
     for app_name in os.listdir(user_path):
-        full_path = os.path.join(user_path, app_name)
-        if os.path.isdir(full_path):
+        full = os.path.join(user_path, app_name)
+        if os.path.isdir(full):
+
             pid = f"{username}_{app_name}"
-            is_running = False
-            if pid in running_processes:
-                if running_processes[pid].poll() is None:
-                    is_running = True
-                else:
-                    del running_processes[pid]
-            
-            logs = "Waiting for logs..."
-            log_file = os.path.join(full_path, "logs.txt")
+            running = pid in running_processes and running_processes[pid].poll() is None
+
+            log_file = os.path.join(full, "logs.txt")
+            logs = ""
+
             if os.path.exists(log_file):
-                try:
-                    with open(log_file, 'r', errors='ignore') as f:
-                        f.seek(0, 2); size = f.tell()
-                        f.seek(max(size - 3000, 0))
-                        logs = f.read()
-                except: pass
-            apps.append({"name": app_name, "running": is_running, "logs": logs})
+                with open(log_file, "r", errors="ignore") as f:
+                    logs = f.read()[-3000:]
+
+            apps.append({
+                "name": app_name,
+                "running": running,
+                "logs": logs
+            })
+
     return jsonify({"apps": apps})
 
-@app.route('/action', methods=['POST'])
+# ================= ACTION =================
+
+@app.route("/action", methods=["POST"])
 def action():
     data = request.json
-    act = data.get('action')
-    usr = data.get('username')
-    app_name = data.get('app_name')
-    
-    pid = f"{usr}_{app_name}"
-    app_dir = os.path.join(UPLOAD_FOLDER, usr, app_name)
-    
-    if act == "start":
-        if pid in running_processes and running_processes[pid].poll() is None:
-            return jsonify({"message": "Already Running!"})
-            
-        script_path, script_dir = find_bot_file(app_dir)
-        if not script_path:
-            return jsonify({"error": "No python file found!"}), 404
-            
-        log_file = open(os.path.join(app_dir, "logs.txt"), "a")
-        
-        try:
-            my_env = os.environ.copy()
-            proc = subprocess.Popen(
-                [sys.executable, "-u", os.path.basename(script_path)],
-                cwd=script_dir,
-                stdout=log_file,
-                stderr=log_file,
-                text=True,
-                env=my_env
-            )
-            running_processes[pid] = proc
-            
-            # বট রান করার পর ডেভেলপারের Chat ID সংগ্রহ করা (ব্রডকাস্টের জন্য জরুরি)
-            token = extract_token_from_code(script_path)
-            if token:
-                threading.Thread(target=update_user_chat_id, args=(usr, token)).start()
-            
-            return jsonify({"message": "Bot Started!"})
-        except Exception as e:
-            return jsonify({"error": f"Start failed: {str(e)}"}), 500
+    act = data.get("action")
+    username = data.get("username")
+    app_name = data.get("app_name")
 
-    elif act == "stop":
+    pid = f"{username}_{app_name}"
+    app_dir = os.path.join(UPLOAD_FOLDER, username, app_name)
+
+    # ---------- START ----------
+    if act == "start":
+
+        if pid in running_processes and running_processes[pid].poll() is None:
+            return jsonify({"message": "Already running"})
+
+        script, cwd = find_main_py(app_dir)
+
+        if not script:
+            return jsonify({"error": "No python file"}), 404
+
+        log = open(os.path.join(app_dir, "logs.txt"), "a")
+
+        proc = subprocess.Popen(
+            [sys.executable, "-u", os.path.basename(script)],
+            cwd=cwd,
+            stdout=log,
+            stderr=log,
+            text=True
+        )
+
+        running_processes[pid] = proc
+
+        token = extract_token_from_code(script)
+
+        if token:
+            threading.Thread(
+                target=collect_chat_id,
+                args=(username, token),
+                daemon=True
+            ).start()
+
+        return jsonify({"message": "Bot started"})
+
+    # ---------- STOP ----------
+    if act == "stop":
         if pid in running_processes:
-            p = running_processes[pid]
-            p.terminate()
-            try: p.wait(timeout=2)
-            except: p.kill()
+            running_processes[pid].terminate()
             del running_processes[pid]
-            return jsonify({"message": "Stopped!"})
+            return jsonify({"message": "Stopped"})
         return jsonify({"error": "Not running"})
 
-    elif act == "delete":
+    # ---------- DELETE ----------
+    if act == "delete":
         if pid in running_processes:
-            try:
-                running_processes[pid].kill()
-                del running_processes[pid]
-            except: pass
-        if os.path.exists(app_dir):
-            shutil.rmtree(app_dir)
-            return jsonify({"message": "Deleted!"})
-        return jsonify({"error": "Not found"})
+            running_processes[pid].kill()
+            del running_processes[pid]
 
-def update_user_chat_id(username, token):
-    """বট রান করার পর ডেভেলপারের Chat ID নিয়ে আসে"""
-    try:
-        bot = telebot.TeleBot(token)
-        me = bot.get_me()
-        # ডেভেলপার নিজেই যদি বটে কোনো কমান্ড দিয়ে থাকে বা স্টার্ট করে থাকে
-        # টেলিগ্রাম এপিআই সরাসরি ডেভেলপার আইডি দেয় না, তাই আমরা get_updates চেক করি
-        updates = bot.get_updates(limit=1)
-        if updates:
-            chat_id = updates[0].effective_chat.id
-            conn = get_db()
-            conn.execute("UPDATE users SET chat_id = ? WHERE username = ?", (str(chat_id), username))
-            conn.commit()
-            conn.close()
-            print(f"Chat ID updated for {username}: {chat_id}")
-    except Exception as e:
-        print(f"Failed to get Chat ID: {e}")
+        shutil.rmtree(app_dir, ignore_errors=True)
+        return jsonify({"message": "Deleted"})
 
-@app.route('/broadcast', methods=['POST'])
+    return jsonify({"error": "Invalid action"}), 400
+
+# ================= BROADCAST =================
+
+@app.route("/broadcast", methods=["POST"])
 def broadcast():
     data = request.json
-    admin_key = data.get('admin_key')
-    
-    # এডমিন কী চেক (পাসওয়ার্ড নেই, শুধু সিকিউরিটি কী)
-    if admin_key != "PROTECTED_BROADCAST_KEY":
+
+    if data.get("admin_key") != "PROTECTED_BROADCAST_KEY":
         return jsonify({"error": "Unauthorized"}), 403
 
-    msg = data.get('message')
-    img = data.get('image_url')
-    btn_name = data.get('button_name')
-    btn_url = data.get('button_url')
-    
+    msg = data.get("message")
+    img = data.get("image_url")
+    btn_name = data.get("button_name")
+    btn_url = data.get("button_url")
+
     if not msg:
         return jsonify({"error": "Message empty"}), 400
 
     conn = get_db()
-    # এখানে আমরা Token এবং Chat ID দুটোই নিচ্ছি
-    users = conn.execute("SELECT username, bot_token, chat_id FROM users").fetchall()
+    users = conn.execute(
+        "SELECT bot_token, chat_id FROM users"
+    ).fetchall()
     conn.close()
-    
-    def send_message_thread(token, chat_id):
-        if not token or not chat_id: return
+
+    sent = 0
+
+    def send(token, chat_id):
+        nonlocal sent
         try:
             bot = telebot.TeleBot(token)
+
             markup = None
             if btn_name and btn_url:
                 markup = telebot.types.InlineKeyboardMarkup()
-                markup.add(telebot.types.InlineKeyboardButton(btn_name, url=btn_url))
-            
+                markup.add(
+                    telebot.types.InlineKeyboardButton(btn_name, url=btn_url)
+                )
+
             if img:
-                bot.send_photo(chat_id=chat_id, photo=img, caption=msg, reply_markup=markup)
+                bot.send_photo(chat_id, img, caption=msg, reply_markup=markup)
             else:
-                bot.send_message(chat_id=chat_id, text=msg, reply_markup=markup)
-            print(f"Sent to {chat_id}")
+                bot.send_message(chat_id, msg, reply_markup=markup)
+
+            sent += 1
+            print("Sent to", chat_id)
+
         except Exception as e:
-            print(f"Broadcast failed for {chat_id}: {e}")
+            print("Failed:", chat_id, e)
 
     threads = []
-    for user in users:
-        token = user['bot_token']
-        chat_id = user['chat_id']
-        
-        # যদি Chat ID না থাকে, তবে পাস করবে (আগের সমস্যার সমাধান)
-        if token and chat_id:
-            t = threading.Thread(target=send_message_thread, args=(token, chat_id))
-            threads.append(t)
-            t.start()
-            time.sleep(0.1) # ফ্লাড এভয়েড করতে সামান্য ডিলে
-            
-    return jsonify({"status": "Broadcasting Started", "total_targets": len(threads)})
 
-@app.route('/server_stats', methods=['GET'])
-def server_stats():
-    uptime_seconds = int(time.time() - server_start_time)
-    active_bots = sum(1 for p in running_processes.values() if p.poll() is None)
-    return jsonify({"uptime": uptime_seconds, "active_bots": active_bots})
+    for u in users:
+        if u["bot_token"] and u["chat_id"]:
+            t = threading.Thread(
+                target=send,
+                args=(u["bot_token"], u["chat_id"])
+            )
+            t.start()
+            threads.append(t)
+            time.sleep(0.05)
+
+    return jsonify({
+        "status": "Broadcast started",
+        "targets": len(threads)
+    })
+
+# ================= SERVER STATS =================
+
+@app.route("/server_stats")
+def stats():
+    active = sum(p.poll() is None for p in running_processes.values())
+
+    return jsonify({
+        "uptime": int(time.time() - server_start_time),
+        "active_bots": active
+    })
+
+# ================= RUN =================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
