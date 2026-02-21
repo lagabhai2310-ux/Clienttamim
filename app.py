@@ -23,9 +23,7 @@ UPLOAD_FOLDER = "user_uploads"
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DB_NAME = os.path.join(BASE_DIR, "hostpromax.db")
 
-ADMIN_USER = "admin"
-ADMIN_PASS = "2010"
-DASHBOARD_PASS = "2310"
+# সকল হার্ডকোডড পাসওয়ার্ড সরানো হয়েছে
 
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
@@ -35,17 +33,18 @@ server_start_time = time.time()
 
 # --- DATABASE SETUP ---
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=10)
     c = conn.cursor()
+    # chat_id কলাম যোগ করা হয়েছে সঠিক ব্রডকাস্টের জন্য
     c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, bot_token TEXT)''')
+                 (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, bot_token TEXT, chat_id TEXT)''')
     conn.commit()
     conn.close()
 
 init_db()
 
 def get_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -85,7 +84,7 @@ def find_bot_file(folder_path):
 
 @app.route('/')
 def home():
-    return jsonify({"status": "Running", "message": "Host Pro Max Backend V2.1 Optimized"})
+    return jsonify({"status": "Running", "message": "Host Pro Max Backend V2.2 Fixed"})
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -95,8 +94,8 @@ def register():
     if not u or not p: return jsonify({"error": "Missing fields"}), 400
     try:
         conn = get_db()
-        conn.execute("INSERT INTO users (username, password, bot_token) VALUES (?, ?, ?)", 
-                     (u, generate_password_hash(p), ""))
+        conn.execute("INSERT INTO users (username, password, bot_token, chat_id) VALUES (?, ?, ?, ?)", 
+                     (u, generate_password_hash(p), "", ""))
         conn.commit()
         return jsonify({"message": "Success"})
     except:
@@ -148,9 +147,6 @@ def upload():
                 z.extractall(user_dir)
             os.remove(save_path)
             
-            # আমরা এখানে আর pip install করব না কারণ সব আগেই ইনস্টল করা আছে
-            # এটি আপলোড স্পিড অনেক বাড়িয়ে দেবে
-            
             main_file, _ = find_bot_file(user_dir)
             if main_file:
                 detected_token = extract_token_from_code(main_file)
@@ -163,6 +159,7 @@ def upload():
     if detected_token:
         try:
             conn = get_db()
+            # টোকেন আপডেট করছি, কিন্তু Chat ID এখনো পরিষ্কার নেই
             conn.execute("UPDATE users SET bot_token = ? WHERE username = ?", (detected_token, username))
             conn.commit()
             conn.close()
@@ -233,12 +230,11 @@ def action():
             )
             running_processes[pid] = proc
             
+            # বট রান করার পর ডেভেলপারের Chat ID সংগ্রহ করা (ব্রডকাস্টের জন্য জরুরি)
             token = extract_token_from_code(script_path)
             if token:
-                conn = get_db()
-                conn.execute("UPDATE users SET bot_token = ? WHERE username = ?", (token, usr))
-                conn.commit()
-                conn.close()
+                threading.Thread(target=update_user_chat_id, args=(usr, token)).start()
+            
             return jsonify({"message": "Bot Started!"})
         except Exception as e:
             return jsonify({"error": f"Start failed: {str(e)}"}), 500
@@ -264,11 +260,30 @@ def action():
             return jsonify({"message": "Deleted!"})
         return jsonify({"error": "Not found"})
 
+def update_user_chat_id(username, token):
+    """বট রান করার পর ডেভেলপারের Chat ID নিয়ে আসে"""
+    try:
+        bot = telebot.TeleBot(token)
+        me = bot.get_me()
+        # ডেভেলপার নিজেই যদি বটে কোনো কমান্ড দিয়ে থাকে বা স্টার্ট করে থাকে
+        # টেলিগ্রাম এপিআই সরাসরি ডেভেলপার আইডি দেয় না, তাই আমরা get_updates চেক করি
+        updates = bot.get_updates(limit=1)
+        if updates:
+            chat_id = updates[0].effective_chat.id
+            conn = get_db()
+            conn.execute("UPDATE users SET chat_id = ? WHERE username = ?", (str(chat_id), username))
+            conn.commit()
+            conn.close()
+            print(f"Chat ID updated for {username}: {chat_id}")
+    except Exception as e:
+        print(f"Failed to get Chat ID: {e}")
+
 @app.route('/broadcast', methods=['POST'])
 def broadcast():
     data = request.json
     admin_key = data.get('admin_key')
     
+    # এডমিন কী চেক (পাসওয়ার্ড নেই, শুধু সিকিউরিটি কী)
     if admin_key != "PROTECTED_BROADCAST_KEY":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -281,15 +296,12 @@ def broadcast():
         return jsonify({"error": "Message empty"}), 400
 
     conn = get_db()
-    users = conn.execute("SELECT username, bot_token FROM users").fetchall()
+    # এখানে আমরা Token এবং Chat ID দুটোই নিচ্ছি
+    users = conn.execute("SELECT username, bot_token, chat_id FROM users").fetchall()
     conn.close()
     
-    success_count = 0
-    failed_count = 0
-    
-    def send_message_thread(token):
-        nonlocal success_count, failed_count
-        if not token: return
+    def send_message_thread(token, chat_id):
+        if not token or not chat_id: return
         try:
             bot = telebot.TeleBot(token)
             markup = None
@@ -298,21 +310,24 @@ def broadcast():
                 markup.add(telebot.types.InlineKeyboardButton(btn_name, url=btn_url))
             
             if img:
-                bot.send_photo(chat_id=token.split(":")[0], photo=img, caption=msg, reply_markup=markup)
+                bot.send_photo(chat_id=chat_id, photo=img, caption=msg, reply_markup=markup)
             else:
-                bot.send_message(chat_id=token.split(":")[0], text=msg, reply_markup=markup)
-            success_count += 1
+                bot.send_message(chat_id=chat_id, text=msg, reply_markup=markup)
+            print(f"Sent to {chat_id}")
         except Exception as e:
-            print(f"Broadcast failed: {e}")
-            failed_count += 1
+            print(f"Broadcast failed for {chat_id}: {e}")
 
     threads = []
     for user in users:
         token = user['bot_token']
-        if token:
-            t = threading.Thread(target=send_message_thread, args=(token,))
+        chat_id = user['chat_id']
+        
+        # যদি Chat ID না থাকে, তবে পাস করবে (আগের সমস্যার সমাধান)
+        if token and chat_id:
+            t = threading.Thread(target=send_message_thread, args=(token, chat_id))
             threads.append(t)
             t.start()
+            time.sleep(0.1) # ফ্লাড এভয়েড করতে সামান্য ডিলে
             
     return jsonify({"status": "Broadcasting Started", "total_targets": len(threads)})
 
